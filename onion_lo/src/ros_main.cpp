@@ -60,83 +60,92 @@ void Onion_LO::livox_handler(const livox_ros_driver::CustomMsg::ConstPtr& livox_
     T_pointcloud.header = livox_msg_in->header;
     PointCloudCallback(boost::make_shared<sensor_msgs::PointCloud2>(T_pointcloud));
 }
+/**
+ * [功能描述]：激光雷达点云数据回调函数，处理单帧点云数据并完成SLAM流程
+ * @param lidar_msg：激光雷达点云消息指针，包含原始点云数据
+ * @return 无返回值
+ */
 void Onion_LO::PointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& lidar_msg) {
-	//1. deskew------------------------------------------------------
-	cout << "\033[1;32m----------------Onion-LO----------------\033[0m" << endl;
-	auto odom_start_time = std::chrono::high_resolution_clock::now();
-	save_timestamp=lidar_msg->header.stamp;    
-	int point_count = lidar_msg->width * lidar_msg->height;
-	Vector6dVector deskew_scan;
-	Vector6dVector color_scan;
-	Vector6dVector key_points;
-	Vector6dVector map_points;
-	map_points.reserve(point_count);
+	//1. 点云去畸变处理------------------------------------------------------
+	cout << "\033[1;32m----------------Onion-LO----------------\033[0m" << endl; // 打印绿色标题
+	auto odom_start_time = std::chrono::high_resolution_clock::now(); // 记录整个里程计开始时间
+	save_timestamp=lidar_msg->header.stamp;    // 保存当前帧时间戳
+	int point_count = lidar_msg->width * lidar_msg->height; // 计算点云总点数
+	Vector6dVector deskew_scan; // 去畸变后的点云数据 [x,y,z,intensity,time,color]
+	Vector6dVector color_scan;  // 带颜色信息的点云数据
+	Vector6dVector key_points;  // 关键点集合
+	Vector6dVector map_points;  // 地图点集合
+	map_points.reserve(point_count); // 预分配内存空间
 	deskew_scan.reserve(point_count);
 	color_scan.reserve(point_count);
-	key_points.reserve(config_.exp_key_num);
-	DeskewLidarData(lidar_msg, deskew_scan);
-	//2. Onion--------------------------------------------------------
-	auto start_time = std::chrono::high_resolution_clock::now();
-	onion.Create_Onion(deskew_scan, Resolution_v,Resolution_h, config_.exp_key_num);
-    color_scan = onion.Classifier();
-    map_points = onion.NEW_Downsample_PointCloud(config_.exp_key_num, key_points);
-    onion.clear();
-    double factor = onion.Onion_Factor;
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> duration = end_time - start_time;
-
-    //3.odom-------------------------------------------------------
-    Sophus::SE3d new_pose = Sophus::SE3d();
-    const auto prediction = GetPredictionModel();
-    const auto last_pose = !poses_.empty() ? poses_.back() : Sophus::SE3d();
-    const auto initial_guess = last_pose*prediction ;
-	const auto keypoint = Onion_odom_.RegisterFrame(key_points, map_points, factor, initial_guess, new_pose);
-	poses_.push_back(new_pose);
-	auto save_local_map_ = Onion_odom_.LocalMap();
-	auto odom_end_time = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double, std::milli> odom_duration = odom_end_time - odom_start_time;
-	//4.results------------------------------------------------------
-	color_cloud = Eigen6dToPointCloud2(color_scan);
-    scan_keypoint_enhance = Eigen6dToPointCloud2(key_points);
-	save_map_points = Eigen6dToPointCloud2(save_local_map_);
-    const Eigen::Vector3d t_current = new_pose.translation();
-    const Eigen::Quaterniond q_current = new_pose.unit_quaternion();
-
-    // Broadcast the tf
-    geometry_msgs::TransformStamped transform_msg;
-    transform_msg.header.stamp = ros::Time::now();
-    transform_msg.header.frame_id = odom_frame_;
-    transform_msg.child_frame_id = child_frame_;
-    transform_msg.transform.rotation.x = q_current.x();
-    transform_msg.transform.rotation.y = q_current.y();
-    transform_msg.transform.rotation.z = q_current.z();
-    transform_msg.transform.rotation.w = q_current.w();
-    transform_msg.transform.translation.x = t_current.x();
-    transform_msg.transform.translation.y = t_current.y();
-    transform_msg.transform.translation.z = t_current.z();
-    tf_broadcaster_.sendTransform(transform_msg);
-    // publish odometry msg
-    nav_msgs::Odometry odom_msg;
-    odom_msg.header.stamp = save_timestamp;                                                                    
-    odom_msg.header.frame_id = odom_frame_;
-    odom_msg.child_frame_id = child_frame_;
-    odom_msg.pose.pose.orientation.x = q_current.x();
-    odom_msg.pose.pose.orientation.y = q_current.y();
-    odom_msg.pose.pose.orientation.z = q_current.z();
-    odom_msg.pose.pose.orientation.w = q_current.w();
-    odom_msg.pose.pose.position.x = t_current.x();
-    odom_msg.pose.pose.position.y = t_current.y();
-    odom_msg.pose.pose.position.z = t_current.z();
+	key_points.reserve(config_.exp_key_num); // 预分配关键点数量
+	DeskewLidarData(lidar_msg, deskew_scan); // 执行点云去畸变处理
 	
-    // tum
-    if (Save_path){
-    	std::ofstream foutC(ROOT_DIR+string("results/Onion.txt"), std::ios::app);
-		foutC.setf(std::ios::fixed, std::ios::floatfield);
-		if (first_scan){
-			base_timestamp = save_timestamp;
-			first_scan = 0;
+	//2. Onion特征提取--------------------------------------------------------
+	auto start_time = std::chrono::high_resolution_clock::now(); // 记录Onion处理开始时间
+	onion.Create_Onion(deskew_scan, Resolution_v,Resolution_h, config_.exp_key_num); // 创建Onion结构体
+    color_scan = onion.Classifier(); // 对点云进行分类并添加颜色信息
+    map_points = onion.NEW_Downsample_PointCloud(config_.exp_key_num, key_points); // 下采样并提取关键点
+    onion.clear(); // 清空Onion结构体释放内存
+    double factor = onion.Onion_Factor; // 获取Onion因子
+    auto end_time = std::chrono::high_resolution_clock::now(); // 记录Onion处理结束时间
+    std::chrono::duration<double, std::milli> duration = end_time - start_time; // 计算Onion处理耗时
+
+    //3. 里程计计算-------------------------------------------------------
+    Sophus::SE3d new_pose = Sophus::SE3d(); // 初始化新位姿为单位变换
+    const auto prediction = GetPredictionModel(); // 获取运动预测模型
+    const auto last_pose = !poses_.empty() ? poses_.back() : Sophus::SE3d(); // 获取上一帧位姿
+    const auto initial_guess = last_pose*prediction ; // 计算初始位姿估计
+	const auto keypoint = Onion_odom_.RegisterFrame(key_points, map_points, factor, initial_guess, new_pose); // 执行帧间配准
+	poses_.push_back(new_pose); // 将新位姿添加到位姿序列
+	auto save_local_map_ = Onion_odom_.LocalMap(); // 获取局部地图
+	auto odom_end_time = std::chrono::high_resolution_clock::now(); // 记录里程计结束时间
+	std::chrono::duration<double, std::milli> odom_duration = odom_end_time - odom_start_time; // 计算总耗时
+	
+	//4. 结果处理和发布------------------------------------------------------
+	color_cloud = Eigen6dToPointCloud2(color_scan); // 将带颜色的点云转换为PCL格式
+    scan_keypoint_enhance = Eigen6dToPointCloud2(key_points); // 将关键点转换为PCL格式
+	save_map_points = Eigen6dToPointCloud2(save_local_map_); // 将局部地图转换为PCL格式
+    const Eigen::Vector3d t_current = new_pose.translation(); // 提取当前位姿的平移向量
+    const Eigen::Quaterniond q_current = new_pose.unit_quaternion(); // 提取当前位姿的四元数
+
+    // 发布TF变换
+    geometry_msgs::TransformStamped transform_msg; // 创建TF变换消息
+    transform_msg.header.stamp = ros::Time::now(); // 设置时间戳
+    transform_msg.header.frame_id = odom_frame_; // 设置父坐标系
+    transform_msg.child_frame_id = child_frame_; // 设置子坐标系
+    transform_msg.transform.rotation.x = q_current.x(); // 设置四元数x分量
+    transform_msg.transform.rotation.y = q_current.y(); // 设置四元数y分量
+    transform_msg.transform.rotation.z = q_current.z(); // 设置四元数z分量
+    transform_msg.transform.rotation.w = q_current.w(); // 设置四元数w分量
+    transform_msg.transform.translation.x = t_current.x(); // 设置平移x分量
+    transform_msg.transform.translation.y = t_current.y(); // 设置平移y分量
+    transform_msg.transform.translation.z = t_current.z(); // 设置平移z分量
+    tf_broadcaster_.sendTransform(transform_msg); // 发布TF变换
+    
+    // 发布里程计消息
+    nav_msgs::Odometry odom_msg; // 创建里程计消息
+    odom_msg.header.stamp = save_timestamp; // 设置时间戳为激光雷达时间戳                                                                    
+    odom_msg.header.frame_id = odom_frame_; // 设置父坐标系
+    odom_msg.child_frame_id = child_frame_; // 设置子坐标系
+    odom_msg.pose.pose.orientation.x = q_current.x(); // 设置位姿四元数x分量
+    odom_msg.pose.pose.orientation.y = q_current.y(); // 设置位姿四元数y分量
+    odom_msg.pose.pose.orientation.z = q_current.z(); // 设置位姿四元数z分量
+    odom_msg.pose.pose.orientation.w = q_current.w(); // 设置位姿四元数w分量
+    odom_msg.pose.pose.position.x = t_current.x(); // 设置位姿位置x分量
+    odom_msg.pose.pose.position.y = t_current.y(); // 设置位姿位置y分量
+    odom_msg.pose.pose.position.z = t_current.z(); // 设置位姿位置z分量
+	
+    // TUM格式轨迹保存
+    if (Save_path){ // 如果启用轨迹保存
+    	std::ofstream foutC(ROOT_DIR+string("results/Onion.txt"), std::ios::app); // 打开轨迹文件（追加模式）
+		foutC.setf(std::ios::fixed, std::ios::floatfield); // 设置浮点数格式
+		if (first_scan){ // 如果是第一帧
+			base_timestamp = save_timestamp; // 记录基准时间戳
+			first_scan = 0; // 标记已处理第一帧
 		}
-		ros::Duration save_duration = save_timestamp - base_timestamp;
+		ros::Duration save_duration = save_timestamp - base_timestamp; // 计算相对时间
+		// 写入TUM格式：时间戳 x y z qx qy qz qw
 		foutC << save_timestamp << " "
 		      << odom_msg.pose.pose.position.x << " "
 		      << odom_msg.pose.pose.position.y << " "
@@ -145,34 +154,39 @@ void Onion_LO::PointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr& lida
 		      << odom_msg.pose.pose.orientation.y << " "
 		      << odom_msg.pose.pose.orientation.z << " "
 		      << odom_msg.pose.pose.orientation.w << std::endl;
-		foutC.close();
+		foutC.close(); // 关闭文件
     }
-    scan_num++;
-    if (scan_num%1==0){
-		geometry_msgs::PoseStamped pose_msg;
-		pose_msg.pose = odom_msg.pose.pose;
-		pose_msg.header = odom_msg.header;
-		path_msg_.poses.push_back(pose_msg);
-		traj_publisher_.publish(path_msg_);
+    scan_num++; // 增加扫描计数
+    if (scan_num%1==0){ // 每帧都发布轨迹（可调整发布频率）
+		geometry_msgs::PoseStamped pose_msg; // 创建位姿消息
+		pose_msg.pose = odom_msg.pose.pose; // 复制位姿信息
+		pose_msg.header = odom_msg.header; // 复制头部信息
+		path_msg_.poses.push_back(pose_msg); // 添加到路径消息
+		traj_publisher_.publish(path_msg_); // 发布轨迹
 	}
-	sensor_msgs::PointCloud2 rgb_pointscan;
-	pcl::toROSMsg(*color_cloud, rgb_pointscan);
-	rgb_pointscan.header.stamp = ros::Time::now();
-	rgb_pointscan.header.frame_id = child_frame_;
-	frame_publisher_.publish(rgb_pointscan);
 	
-	sensor_msgs::PointCloud2 key_pointcloud;
-	pcl::toROSMsg(*scan_keypoint_enhance, key_pointcloud);
-	key_pointcloud.header.stamp = ros::Time::now();
-	key_pointcloud.header.frame_id = child_frame_;
-	kpoints_publisher_.publish(key_pointcloud);
+	// 发布带颜色的点云
+	sensor_msgs::PointCloud2 rgb_pointscan; // 创建点云消息
+	pcl::toROSMsg(*color_cloud, rgb_pointscan); // 转换PCL点云为ROS消息
+	rgb_pointscan.header.stamp = ros::Time::now(); // 设置时间戳
+	rgb_pointscan.header.frame_id = child_frame_; // 设置坐标系
+	frame_publisher_.publish(rgb_pointscan); // 发布点云
 	
-    sensor_msgs::PointCloud2 map_msg;
-	pcl::toROSMsg(*save_map_points, map_msg);	
-	map_msg.header.stamp = ros::Time::now();
-	map_msg.header.frame_id = odom_frame_;
-	local_map_publisher_.publish(map_msg);
-	Onion_LO::resetParameters();
+	// 发布关键点云
+	sensor_msgs::PointCloud2 key_pointcloud; // 创建关键点云消息
+	pcl::toROSMsg(*scan_keypoint_enhance, key_pointcloud); // 转换PCL点云为ROS消息
+	key_pointcloud.header.stamp = ros::Time::now(); // 设置时间戳
+	key_pointcloud.header.frame_id = child_frame_; // 设置坐标系
+	kpoints_publisher_.publish(key_pointcloud); // 发布关键点云
+	
+	// 发布局部地图
+    sensor_msgs::PointCloud2 map_msg; // 创建地图消息
+	pcl::toROSMsg(*save_map_points, map_msg); // 转换PCL点云为ROS消息
+	map_msg.header.stamp = ros::Time::now(); // 设置时间戳
+	map_msg.header.frame_id = odom_frame_; // 设置坐标系为里程计坐标系
+	local_map_publisher_.publish(map_msg); // 发布局部地图
+	
+	Onion_LO::resetParameters(); // 重置参数，清空临时数据
 }
 
 Sophus::SE3d Onion_LO::GetPredictionModel() const {
